@@ -38,6 +38,7 @@ Files:
 | `spinmon.c` | The library, plus a demo `main()` (omit with `-DSPINMON_NO_DEMO`) |
 | `test_contention.c` | Regression gate on lock contention (record a baseline, compare later) |
 | `test_monitor_lease.c` | Deterministic tests for the monitor logic and the lease protocol |
+| `test_rendezvous.c` | Deterministic tests for the rotating-destination rendezvous (section 3.6) |
 
 ---
 
@@ -322,6 +323,36 @@ Points that matter:
 - Time source is `CLOCK_MONOTONIC`, shared by all processes on one host. This does **not** work across hosts.
 - The 48-bit microsecond heartbeat wraps after about 8.9 years of uptime.
 - Liveness is judged only by heartbeat age. An owner that is busy but not heartbeating looks dead.
+
+### 3.6 The rendezvous (moving destination)
+
+A destination that changes when authorized followers ping, so that only followers know the current one.
+Built on the ticket lock (state guard) and the lease (the server role is fenceable).
+
+```c
+static sm_rendezvous R;                       /* static or aligned */
+sm_rv_open(&R, /*server*/1, /*lease_ns*/1e9, /*every_n*/1, /*every_ns*/0, /*grace_ns*/50e6);
+
+uint64_t key[2]; sm_rv_gen_key(key);          /* give to the follower out of band */
+sm_rv_enroll(&R, /*id*/5, key);
+
+/* follower */
+sm_rv_reply r;
+if (sm_rv_ping(&R, 5, known_epoch, sm_rv_proof(key, 5, known_epoch), &r) == SM_RV_OK) {
+    known_epoch = r.epoch;
+    dest = sm_rv_unseal(key, 5, &r);          /* the new reference */
+}
+
+/* resource side */
+if (sm_rv_resolve(&R, presented_dest)) { /* serve */ }
+```
+
+- `dest(epoch) = SipHash-2-4(master_key, epoch)`; the reply is sealed with a per-follower keyed pad, so a captured reply is useless without that follower's key.
+- Only a valid ping from an enrolled follower can rotate. Unknown ids (`SM_RV_DENIED`) and wrong keys (`SM_RV_BAD_PROOF`) get nothing and change nothing.
+- Rotation policy: every `every_n` valid pings and/or when `every_ns` has elapsed since the last rotation.
+- `grace_ns`: the previous destination still resolves for that long, so a follower with a ping in flight is not cut off. Two rotations back is always dead.
+- `sm_rv_revoke` + `sm_rv_rotate` cuts a follower off. A server that loses its lease is fenced (`SM_RV_FENCED`).
+- Scope: same-host shared memory, not a network protocol. A proof can be replayed within an epoch (replies stay sealed). Anything that can read the struct's memory can read the master key; the guarantee is against parties that use only the API.
 
 ---
 
@@ -608,6 +639,17 @@ numbers, no real reaction-latency measurements on a dedicated core, no aarch64 r
 | `sm_lease_renew(L, me, fence)` | Heartbeat; false means lost or fenced |
 | `sm_lease_release(L, me)` | False if not the owner |
 | `sm_lease_peek(L, &owner, &age_ns)` | Monitor-side read; false if free |
+
+**Rendezvous**
+
+| Function | Notes |
+|---|---|
+| `sm_rv_open(R, server, lease_ns, every_n, every_ns, grace_ns)` | Take the server role; false if no entropy or lease |
+| `sm_rv_gen_key(key)` / `sm_rv_enroll(R, id, key)` / `sm_rv_revoke(R, id)` | Follower management |
+| `sm_rv_ping(R, id, known_epoch, proof, &reply)` | Follower ping; may rotate. Returns `sm_rv_status` |
+| `sm_rv_proof(key, id, known_epoch)` / `sm_rv_unseal(key, id, &reply)` | Follower-side helpers |
+| `sm_rv_resolve(R, dest)` | Resource side: is `dest` live (or in grace)? |
+| `sm_rv_rotate(R)` | Force a rotation |
 
 **Feed and monitor**
 

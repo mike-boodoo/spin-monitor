@@ -2,3 +2,4 @@ spinmon
 test_contention
 test_monitor_lease
 baseline.txt
+test_rendezvous

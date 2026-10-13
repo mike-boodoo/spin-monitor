@@ -327,6 +327,225 @@ static bool sm_lease_release(sm_lease *L, uint16_t me)
 }
 
 /* ------------------------------------------------------------------ */
+/* 4b. rendezvous: a destination that moves, known only to followers   */
+/*                                                                     */
+/*   The server owns a destination token. A ping from an enrolled      */
+/*   follower counts toward a rotation policy (every N pings and/or    */
+/*   every T ns). On rotation the token becomes                        */
+/*       dest(epoch) = SipHash-2-4(master_key, epoch)                  */
+/*   and the ping reply carries it SEALED: dest ^ PRF(follower_key,    */
+/*   epoch, id). Only a holder of that follower's key can unseal it.   */
+/*   Outsiders get no reply, cannot trigger a rotation, and fail       */
+/*   sm_rv_resolve with any stale or guessed destination.              */
+/*                                                                     */
+/*   Built on the existing pieces: sm_ticket guards state (so          */
+/*   contention shows up in sm_snapshot), sm_lease makes the server    */
+/*   role fenceable (a deposed server's pings are refused).            */
+/*                                                                     */
+/*   Scope: in-process / same-host shared memory. Not a network        */
+/*   protocol: a proof can be replayed within an epoch (the reply      */
+/*   stays sealed, so a replay learns nothing). A party that can read  */
+/*   this struct's memory can read master_key; the guarantee is        */
+/*   against participants that only use the API.                       */
+/* ------------------------------------------------------------------ */
+
+#define SM_RV_MAX 16
+
+typedef enum {
+    SM_RV_OK = 0,
+    SM_RV_DENIED,       /* id not enrolled: no rotation, no reply */
+    SM_RV_BAD_PROOF,    /* enrolled id, wrong key: no rotation, no reply */
+    SM_RV_FENCED,       /* this server lost its lease */
+    SM_RV_FULL          /* enroll: follower table full or id invalid/duplicate */
+} sm_rv_status;
+
+typedef struct {
+    uint64_t epoch;     /* destination generation the reply belongs to */
+    uint64_t sealed;    /* dest ^ pad; use sm_rv_unseal */
+} sm_rv_reply;
+
+typedef struct {
+    uint64_t key[2];
+    uint16_t id;        /* 0 == unused slot */
+    uint64_t last_ping_ns;
+} sm_rv_follower;
+
+typedef struct {
+    sm_ticket lock;
+    sm_lease  lease;
+    uint64_t  master[2];
+    uint64_t  fence;
+    uint16_t  server;
+    uint64_t  epoch, dest, prev_dest, rotated_ns, pings_since;
+    uint64_t  every_n, every_ns, grace_ns;
+    sm_rv_follower f[SM_RV_MAX];
+} sm_rendezvous;
+
+#define SM_ROTL64(x, b) (((x) << (b)) | ((x) >> (64 - (b))))
+#define SM_SIPROUND do { \
+    v0 += v1; v1 = SM_ROTL64(v1, 13); v1 ^= v0; v0 = SM_ROTL64(v0, 32); \
+    v2 += v3; v3 = SM_ROTL64(v3, 16); v3 ^= v2; \
+    v0 += v3; v3 = SM_ROTL64(v3, 21); v3 ^= v0; \
+    v2 += v1; v1 = SM_ROTL64(v1, 17); v1 ^= v2; v2 = SM_ROTL64(v2, 32); } while (0)
+
+/* SipHash-2-4 of exactly 16 bytes (m0, m1 little-endian words). */
+static uint64_t sm_siphash16(const uint64_t k[2], uint64_t m0, uint64_t m1)
+{
+    uint64_t v0 = k[0] ^ 0x736f6d6570736575ull, v1 = k[1] ^ 0x646f72616e646f6dull;
+    uint64_t v2 = k[0] ^ 0x6c7967656e657261ull, v3 = k[1] ^ 0x7465646279746573ull;
+    uint64_t b = 16ull << 56;
+    v3 ^= m0; SM_SIPROUND; SM_SIPROUND; v0 ^= m0;
+    v3 ^= m1; SM_SIPROUND; SM_SIPROUND; v0 ^= m1;
+    v3 ^= b;  SM_SIPROUND; SM_SIPROUND; v0 ^= b;
+    v2 ^= 0xff;
+    SM_SIPROUND; SM_SIPROUND; SM_SIPROUND; SM_SIPROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+#define SM_RV_TAG_PROOF 0x5052ull
+#define SM_RV_TAG_SEAL  0x5345ull
+
+static uint64_t sm_rv_proof(const uint64_t key[2], uint16_t id, uint64_t known_epoch)
+{
+    return sm_siphash16(key, known_epoch, (SM_RV_TAG_PROOF << 48) | id);
+}
+
+static uint64_t sm_rv_pad(const uint64_t key[2], uint16_t id, uint64_t epoch)
+{
+    return sm_siphash16(key, epoch, (SM_RV_TAG_SEAL << 48) | id);
+}
+
+/* Follower side: recover the destination from a reply. */
+static uint64_t sm_rv_unseal(const uint64_t key[2], uint16_t id, const sm_rv_reply *r)
+{
+    return r->sealed ^ sm_rv_pad(key, id, r->epoch);
+}
+
+static bool sm_rv_random(uint64_t out[2])
+{
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return false;
+    bool ok = fread(out, sizeof(uint64_t), 2, f) == 2;
+    fclose(f);
+    return ok;
+}
+
+/* Fresh random 128-bit follower key. Hand it to the follower out of band. */
+static bool sm_rv_gen_key(uint64_t key[2]) { return sm_rv_random(key); }
+
+/* R must be static or cache-line aligned (it embeds sm_ticket / sm_lease).
+ * Becomes the server `server_id` (nonzero) by taking the lease.
+ * every_n: rotate on every Nth valid ping (0 = never by count; 1 = every ping).
+ * every_ns: also rotate on a valid ping if this long has passed (0 = never by time).
+ * grace_ns: the previous destination still resolves for this long after a rotation. */
+static bool sm_rv_open(sm_rendezvous *R, uint16_t server_id, uint64_t lease_ns,
+                       uint64_t every_n, uint64_t every_ns, uint64_t grace_ns)
+{
+    if (server_id == 0) return false;
+    memset(R, 0, sizeof *R);
+    sm_ticket_init(&R->lock, "rendezvous", 0, NULL, NULL);
+    if (!sm_rv_random(R->master)) return false;
+    if (!sm_lease_acquire(&R->lease, server_id, lease_ns, &R->fence, NULL)) return false;
+    R->server = server_id;
+    R->every_n = every_n; R->every_ns = every_ns; R->grace_ns = grace_ns;
+    R->epoch = 1;
+    R->dest = sm_siphash16(R->master, R->epoch, 0);
+    R->rotated_ns = sm_now_ns();
+    return true;
+}
+
+static sm_rv_status sm_rv_enroll(sm_rendezvous *R, uint16_t id, const uint64_t key[2])
+{
+    sm_rv_status st = SM_RV_FULL;
+    if (id == 0) return st;
+    SM_LOCK(&R->lock);
+    int slot = -1;
+    for (int i = 0; i < SM_RV_MAX; i++) {
+        if (R->f[i].id == id) { slot = -2; break; }
+        if (R->f[i].id == 0 && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        R->f[slot].key[0] = key[0]; R->f[slot].key[1] = key[1];
+        R->f[slot].id = id;
+        st = SM_RV_OK;
+    }
+    sm_unlock(&R->lock);
+    return st;
+}
+
+/* Remove a follower. Takes effect on its next ping; rotate to cut off the old reference. */
+static bool sm_rv_revoke(sm_rendezvous *R, uint16_t id)
+{
+    bool found = false;
+    SM_LOCK(&R->lock);
+    for (int i = 0; i < SM_RV_MAX; i++)
+        if (R->f[i].id == id && id != 0) { memset(&R->f[i], 0, sizeof R->f[i]); found = true; }
+    sm_unlock(&R->lock);
+    return found;
+}
+
+static void sm_rv_rotate_locked(sm_rendezvous *R, uint64_t now)
+{
+    R->prev_dest = R->dest;
+    R->epoch++;
+    R->dest = sm_siphash16(R->master, R->epoch, 0);
+    R->rotated_ns = now;
+    R->pings_since = 0;
+}
+
+/* Force a rotation (e.g. after revoking a follower). */
+static void sm_rv_rotate(sm_rendezvous *R)
+{
+    SM_LOCK(&R->lock);
+    sm_rv_rotate_locked(R, sm_now_ns());
+    sm_unlock(&R->lock);
+}
+
+/* The ping. `proof` = sm_rv_proof(key, id, known_epoch). Only a valid ping can rotate.
+ * The reply is the destination after any rotation this ping caused. */
+static sm_rv_status sm_rv_ping(sm_rendezvous *R, uint16_t id, uint64_t known_epoch,
+                               uint64_t proof, sm_rv_reply *out)
+{
+    sm_rv_status st = SM_RV_DENIED;
+    SM_LOCK(&R->lock);
+    sm_rv_follower *fl = NULL;
+    for (int i = 0; i < SM_RV_MAX && id != 0; i++)
+        if (R->f[i].id == id) { fl = &R->f[i]; break; }
+    if (fl) {
+        st = SM_RV_BAD_PROOF;
+        if (sm_rv_proof(fl->key, id, known_epoch) == proof) {
+            if (!sm_lease_renew(&R->lease, R->server, R->fence)) {
+                st = SM_RV_FENCED;
+            } else {
+                uint64_t now = sm_now_ns();
+                fl->last_ping_ns = now;
+                R->pings_since++;
+                if ((R->every_n && R->pings_since >= R->every_n) ||
+                    (R->every_ns && now - R->rotated_ns >= R->every_ns))
+                    sm_rv_rotate_locked(R, now);
+                out->epoch = R->epoch;
+                out->sealed = R->dest ^ sm_rv_pad(fl->key, id, R->epoch);
+                st = SM_RV_OK;
+            }
+        }
+    }
+    sm_unlock(&R->lock);
+    return st;
+}
+
+/* Resource side: is `dest` the live destination? The previous one is accepted
+ * for grace_ns after a rotation so in-flight followers are not cut off. */
+static bool sm_rv_resolve(sm_rendezvous *R, uint64_t dest)
+{
+    bool ok;
+    SM_LOCK(&R->lock);
+    ok = dest == R->dest ||
+         (R->epoch > 1 && dest == R->prev_dest && sm_now_ns() - R->rotated_ns <= R->grace_ns);
+    sm_unlock(&R->lock);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
 /* 5. seqlock feed + pinned busy-poll monitor                          */
 /* ------------------------------------------------------------------ */
 
