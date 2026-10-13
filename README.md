@@ -39,6 +39,7 @@ Files:
 | `test_contention.c` | Regression gate on lock contention (record a baseline, compare later) |
 | `test_monitor_lease.c` | Deterministic tests for the monitor logic and the lease protocol |
 | `test_rendezvous.c` | Deterministic tests for the rotating-destination rendezvous (section 3.6) |
+| `frontend/` | Browser test bench for the rendezvous (`make serve`) |
 
 ---
 
@@ -353,6 +354,13 @@ if (sm_rv_resolve(&R, presented_dest)) { /* serve */ }
 - `grace_ns`: the previous destination still resolves for that long, so a follower with a ping in flight is not cut off. Two rotations back is always dead.
 - `sm_rv_revoke` + `sm_rv_rotate` cuts a follower off. A server that loses its lease is fenced (`SM_RV_FENCED`).
 - Scope: same-host shared memory, not a network protocol. A proof can be replayed within an epoch (replies stay sealed). Anything that can read the struct's memory can read the master key; the guarantee is against parties that use only the API.
+
+
+**Browser test bench.** `make serve`, then open http://127.0.0.1:8080/. `frontend/rv_server.c` wraps the real
+`sm_rv_*` calls in a small JSON API (127.0.0.1 only). `frontend/index.html` plays the followers and the outsider:
+it holds the follower keys, computes proofs and unseals replies in the browser. From there you can enroll, ping,
+rotate, revoke, try a server takeover (fencing), and attack as an outsider (unenrolled ping, spoofed key,
+unsealing a captured reply, guessing). The server never returns a destination or the master key.
 
 ---
 

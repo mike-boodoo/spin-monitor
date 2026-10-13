@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendezvous Test Bench</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5d6673; --line: #dfe3e8;
+  --accent: #2f6fdb; --ok: #1d8a4e; --warn: #b7791f; --bad: #c2362f; --chip: #eef1f5;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418; --panel: #1a1e24; --ink: #e6e9ee; --muted: #9aa4b2; --line: #2c323b;
+    --accent: #6ea0ff; --ok: #4cc38a; --warn: #e0a84a; --bad: #ff6b61; --chip: #242a32;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111418; --panel: #1a1e24; --ink: #e6e9ee; --muted: #9aa4b2; --line: #2c323b;
+  --accent: #6ea0ff; --ok: #4cc38a; --warn: #e0a84a; --bad: #ff6b61; --chip: #242a32;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+header h1 { font-size: 18px; margin: 0; }
+header p { margin: 0; color: var(--muted); flex: 1 1 320px; }
+main { padding: 16px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  max-width: 1400px; margin: 0 auto; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+section h2 { font-size: 15px; margin: 0 0 4px; }
+section > p.hint { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
+.wide { grid-column: 1 / -1; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-bottom: 10px; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+input { font: inherit; font-family: var(--mono); width: 110px; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+input.long { width: 200px; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--chip); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+.stat { background: var(--chip); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font: 600 18px var(--mono); }
+.stat span { color: var(--muted); font-size: 12px; }
+.mono { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 600;
+  background: var(--chip); }
+.pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
+.followers { display: grid; gap: 10px; }
+.follower { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+.follower .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+.kv { display: grid; grid-template-columns: 92px 1fr; gap: 2px 8px; margin-bottom: 8px; }
+.kv dt { color: var(--muted); font-size: 12px; } .kv dd { margin: 0; }
+.empty { color: var(--muted); font-style: italic; }
+#log { max-height: 280px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+#log li { padding: 4px 0; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+#log li time { color: var(--muted); margin-right: 8px; }
+.sub { margin: 14px 0 6px; font-size: 13px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rendezvous test bench</h1>
+  <p>Drives the real <code>sm_rv_*</code> code in <code>spinmon.c</code>. This page plays the followers and the outsider: it holds follower keys, computes proofs and unseals replies itself. The server never sends a destination in the clear.</p>
+  <span id="selftest" class="pill">SipHash self-test…</span>
+</header>
+<main>
+  <section>
+    <h2>Server</h2>
+    <p class="hint">Opening (re)creates the rendezvous: new master key, epoch 1, all followers cleared.</p>
+    <div class="row">
+      <label>rotate every N pings<input id="every_n" type="number" min="0" value="1"></label>
+      <label>rotate every ms<input id="every_ms" type="number" min="0" value="0"></label>
+      <label>grace ms<input id="grace_ms" type="number" min="0" value="5000"></label>
+      <label>lease ms<input id="lease_ms" type="number" min="1" value="5000"></label>
+      <button class="primary" id="open">Open</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><b id="s_epoch">–</b><span>epoch</span></div>
+      <div class="stat"><b id="s_pings">–</b><span>pings since rotation</span></div>
+      <div class="stat"><b id="s_since">–</b><span>since rotation</span></div>
+      <div class="stat"><b id="s_lease">–</b><span>lease owner / age</span></div>
+      <div class="stat"><b id="s_lock">–</b><span>lock acquisitions</span></div>
+    </div>
+    <div class="sub">Admin</div>
+    <div class="row">
+      <button id="rotate">Rotate now</button>
+      <label>takeover by server id<input id="takeover_id" type="number" min="1" value="2"></label>
+      <button id="takeover">Try takeover</button>
+    </div>
+    <p class="hint">Takeover succeeds only after no valid ping has renewed the lease for <em>lease ms</em>. After that, server 1 is fenced and refuses pings.</p>
+  </section>
+
+  <section>
+    <h2>Followers</h2>
+    <p class="hint">Enrolling hands the follower its key (standing in for an out-of-band handoff). Each ping may rotate the destination; the follower's reference follows.</p>
+    <div class="row">
+      <label>follower id<input id="enroll_id" type="number" min="1" max="65535" value="5"></label>
+      <button class="primary" id="enroll">Enroll</button>
+    </div>
+    <div class="followers" id="followers"><p class="empty">No followers yet.</p></div>
+  </section>
+
+  <section>
+    <h2>Outsider</h2>
+    <p class="hint">Everything an outsider can try through the API. None of it should produce a reply, a rotation, or a live destination.</p>
+    <div class="sub">Ping without enrollment</div>
+    <div class="row">
+      <label>id<input id="o_id" type="number" min="1" max="65535" value="9"></label>
+      <button id="o_ping">Ping with own key</button>
+    </div>
+    <div class="sub">Spoof an enrolled follower</div>
+    <div class="row">
+      <label>id to spoof<input id="o_spoof" type="number" min="1" max="65535" value="5"></label>
+      <button id="o_spoof_btn">Ping with wrong key</button>
+    </div>
+    <div class="sub">Use a captured reply</div>
+    <dl class="kv">
+      <dt>captured</dt><dd class="mono" id="o_captured">nothing yet (a follower must ping)</dd>
+    </dl>
+    <div class="row"><button id="o_unseal" disabled>Unseal with outsider key and resolve</button></div>
+    <div class="sub">Present any destination</div>
+    <div class="row">
+      <label>dest (hex)<input id="o_dest" class="long" placeholder="e.g. a stale reference"></label>
+      <button id="o_resolve">Resolve</button>
+      <button id="o_guess">Guess 200 random</button>
+    </div>
+    <div id="o_result"></div>
+  </section>
+
+  <section class="wide">
+    <h2>Event log</h2>
+    <ul id="log"></ul>
+  </section>
+</main>
+
+<script>
+"use strict";
+/* ---- SipHash-2-4 of 16 bytes, matching sm_siphash16 in spinmon.c ---- */
+const M64 = (1n << 64n) - 1n;
+const rotl = (x, b) => ((x << BigInt(b)) | (x >> BigInt(64 - b))) & M64;
+function sip16(k0, k1, m0, m1) {
+  let v0 = k0 ^ 0x736f6d6570736575n, v1 = k1 ^ 0x646f72616e646f6dn;
+  let v2 = k0 ^ 0x6c7967656e657261n, v3 = k1 ^ 0x7465646279746573n;
+  const round = () => {
+    v0 = (v0 + v1) & M64; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32);
+    v2 = (v2 + v3) & M64; v3 = rotl(v3, 16); v3 ^= v2;
+    v0 = (v0 + v3) & M64; v3 = rotl(v3, 21); v3 ^= v0;
+    v2 = (v2 + v1) & M64; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32);
+  };
+  const b = 16n << 56n;
+  for (const m of [m0, m1, b]) { v3 ^= m; round(); round(); v0 ^= m; }
+  v2 ^= 0xffn; round(); round(); round(); round();
+  return v0 ^ v1 ^ v2 ^ v3;
+}
+const TAG_PROOF = 0x5052n, TAG_SEAL = 0x5345n;
+const proof = (key, id, epoch) => sip16(key[0], key[1], BigInt(epoch), (TAG_PROOF << 48n) | BigInt(id));
+const pad   = (key, id, epoch) => sip16(key[0], key[1], BigInt(epoch), (TAG_SEAL << 48n) | BigInt(id));
+const hex = (x) => x.toString(16).padStart(16, "0");
+const randKey = () => { const a = new BigUint64Array(2); crypto.getRandomValues(a); return [a[0], a[1]]; };
+
+(function selftest() {
+  const ok = sip16(0x0706050403020100n, 0x0f0e0d0c0b0a0908n, 0x0706050403020100n, 0x0f0e0d0c0b0a0908n) === 0x3f2acc7f57c29bdbn;
+  const el = document.getElementById("selftest");
+  el.textContent = ok ? "SipHash self-test passed" : "SipHash self-test FAILED";
+  el.className = "pill " + (ok ? "ok" : "bad");
+})();
+
+/* ---- state ---- */
+const $ = (id) => document.getElementById(id);
+const followers = new Map();   /* id -> { key, epoch, dest, last } */
+let server = null, captured = null;
+
+async function api(path, params = {}) {
+  const r = await fetch("/api/" + path + "?" + new URLSearchParams(params));
+  return r.json();
+}
+function log(msg, cls = "") {
+  const li = document.createElement("li");
+  const t = document.createElement("time"); t.textContent = new Date().toLocaleTimeString();
+  const s = document.createElement("span"); s.textContent = msg; if (cls) s.className = "pill " + cls;
+  li.append(t, s); $("log").prepend(li);
+}
+const pill = (text, cls) => `<span class="pill ${cls}">${text}</span>`;
+
+/* ---- server ---- */
+async function refresh() {
+  let s;
+  try { s = await api("state"); } catch { return; }
+  if (s.error) { server = null; return; }
+  server = s;
+  $("s_epoch").textContent = s.epoch;
+  $("s_pings").textContent = s.pings_since;
+  $("s_since").textContent = (s.since_rotation_ms / 1000).toFixed(1) + "s";
+  $("s_lease").textContent = s.lease.held ? `${s.lease.owner} / ${(s.lease.age_ms / 1000).toFixed(1)}s` : "free";
+  $("s_lock").textContent = s.lock.acquisitions;
+  renderFollowers();
+}
+
+$("open").onclick = async () => {
+  const p = { every_n: $("every_n").value, every_ms: $("every_ms").value, grace_ms: $("grace_ms").value, lease_ms: $("lease_ms").value };
+  const r = await api("open", p);
+  followers.clear(); captured = null; renderCaptured();
+  log(r.ok ? `opened: every_n=${p.every_n} every_ms=${p.every_ms} grace_ms=${p.grace_ms} lease_ms=${p.lease_ms}` : "open failed", r.ok ? "" : "bad");
+  refresh();
+};
+$("rotate").onclick = async () => { await api("rotate"); log("admin: forced rotation"); refresh(); };
+$("takeover").onclick = async () => {
+  const r = await api("takeover", { id: $("takeover_id").value });
+  if (r.error) return log(r.error, "bad");
+  const me = Number($("takeover_id").value);
+  log(r.ok ? (r.from === me ? `server ${me} re-acquired its own expired lease (fence ${r.fence})`
+                            : `server ${me} took over from ${r.from} (fence ${r.fence}); server 1 is now fenced`)
+           : `takeover refused: server ${r.from} heartbeat is ${(r.holder_age_ms / 1000).toFixed(1)}s old (< lease)`, r.ok ? "warn" : "");
+  refresh();
+};
+
+/* ---- followers ---- */
+$("enroll").onclick = async () => {
+  const id = Number($("enroll_id").value);
+  const r = await api("enroll", { id });
+  if (r.error) return log(r.error, "bad");
+  if (r.status !== "ok") return log(`enroll ${id}: ${r.status}`, "bad");
+  followers.set(id, { key: [BigInt("0x" + r.key[0]), BigInt("0x" + r.key[1])], epoch: 0, dest: null, last: "enrolled" });
+  log(`follower ${id} enrolled, key handed over`);
+  $("enroll_id").value = id + 1;
+  refresh();
+};
+
+async function ping(id) {
+  const f = followers.get(id);
+  const r = await api("ping", { id, epoch: f.epoch, proof: hex(proof(f.key, id, f.epoch)) });
+  if (r.status === "ok") {
+    const before = f.dest;
+    f.epoch = r.epoch;
+    f.dest = BigInt("0x" + r.sealed) ^ pad(f.key, id, r.epoch);
+    captured = { id, epoch: r.epoch, sealed: BigInt("0x" + r.sealed) }; renderCaptured();
+    f.last = before === f.dest ? "ping ok, no rotation" : "ping ok, reference updated";
+    log(`follower ${id} ping: epoch ${r.epoch}, dest ${hex(f.dest)}${before === f.dest ? " (unchanged)" : ""}`);
+  } else {
+    f.last = "ping " + r.status;
+    log(`follower ${id} ping refused: ${r.status}`, "bad");
+  }
+  refresh();
+}
+async function use(id) {
+  const f = followers.get(id);
+  if (f.dest === null) return log(`follower ${id} has no reference yet: ping first`, "warn");
+  const r = await api("resolve", { dest: hex(f.dest) });
+  f.last = r.live ? "resolve: live" : "resolve: refused";
+  log(`follower ${id} uses ${hex(f.dest)} (epoch ${f.epoch}): ${r.live ? "live" : "refused"}`, r.live ? "ok" : "bad");
+  renderFollowers();
+}
+async function revoke(id) {
+  await api("revoke", { id });
+  followers.get(id).last = "revoked (keeps its old reference)";
+  log(`follower ${id} revoked. Rotate to cut off its reference; it stays live until it ages out of grace.`, "warn");
+  refresh();
+}
+
+function freshness(f) {
+  if (!server || f.dest === null) return pill("no reference", "");
+  const lag = server.epoch - f.epoch;
+  if (lag === 0) return pill("current", "ok");
+  if (lag === 1) return server.since_rotation_ms <= server.policy.grace_ms
+    ? pill("previous: in grace window", "warn") : pill("previous: grace expired", "bad");
+  return pill(`${lag} behind: stale`, "bad");
+}
+function renderFollowers() {
+  const el = $("followers");
+  if (!followers.size) { el.innerHTML = '<p class="empty">No followers yet.</p>'; return; }
+  const enrolled = new Map((server ? server.followers : []).map((x) => [x.id, x]));
+  el.innerHTML = "";
+  for (const [id, f] of followers) {
+    const srv = enrolled.get(id);
+    const d = document.createElement("div");
+    d.className = "follower";
+    d.innerHTML = `
+      <div class="top"><b>Follower ${id}</b>${srv ? freshness(f) : pill("not enrolled", "bad")}</div>
+      <dl class="kv">
+        <dt>key</dt><dd class="mono">${hex(f.key[0])}…</dd>
+        <dt>known epoch</dt><dd class="mono">${f.epoch || "–"}</dd>
+        <dt>known dest</dt><dd class="mono">${f.dest === null ? "–" : hex(f.dest)}</dd>
+        <dt>last ping</dt><dd>${srv && srv.last_ping_ms_ago >= 0 ? (srv.last_ping_ms_ago / 1000).toFixed(1) + "s ago" : "–"}</dd>
+        <dt>last result</dt><dd>${f.last}</dd>
+      </dl>
+      <div class="row" style="margin:0">
+        <button data-a="ping">Ping</button><button data-a="use">Use destination</button>
+        <button data-a="copy">Copy dest to outsider</button><button data-a="revoke" ${srv ? "" : "disabled"}>Revoke</button>
+      </div>`;
+    d.querySelector('[data-a="ping"]').onclick = () => ping(id);
+    d.querySelector('[data-a="use"]').onclick = () => use(id);
+    d.querySelector('[data-a="copy"]').onclick = () => { if (f.dest !== null) $("o_dest").value = hex(f.dest); };
+    d.querySelector('[data-a="revoke"]').onclick = () => revoke(id);
+    el.append(d);
+  }
+}
+
+/* ---- outsider ---- */
+const outsiderKey = randKey();
+function oResult(text, cls) { $("o_result").innerHTML = pill(text, cls); }
+function renderCaptured() {
+  $("o_captured").textContent = captured ? `follower ${captured.id}, epoch ${captured.epoch}, sealed ${hex(captured.sealed)}` : "nothing yet (a follower must ping)";
+  $("o_unseal").disabled = !captured;
+}
+$("o_ping").onclick = async () => {
+  const id = Number($("o_id").value);
+  const r = await api("ping", { id, epoch: 0, proof: hex(proof(outsiderKey, id, 0)) });
+  const good = r.status !== "ok";
+  oResult(`ping as ${id}: ${r.status}${r.status === "ok" ? " — this id is enrolled" : ""}`, good ? "ok" : "bad");
+  log(`outsider pings as unenrolled ${id}: ${r.status}`, good ? "" : "bad");
+  refresh();
+};
+$("o_spoof_btn").onclick = async () => {
+  const id = Number($("o_spoof").value);
+  const epoch = server ? server.epoch : 0;
+  const r = await api("ping", { id, epoch, proof: hex(proof(outsiderKey, id, epoch)) });
+  oResult(`spoofing ${id}: ${r.status}`, r.status === "ok" ? "bad" : "ok");
+  log(`outsider spoofs follower ${id}: ${r.status}`, r.status === "ok" ? "bad" : "");
+  refresh();
+};
+$("o_unseal").onclick = async () => {
+  const guess = captured.sealed ^ pad(outsiderKey, captured.id, captured.epoch);
+  const r = await api("resolve", { dest: hex(guess) });
+  oResult(`unsealed ${hex(guess)} with outsider key: ${r.live ? "LIVE (should not happen)" : "refused"}`, r.live ? "bad" : "ok");
+  log(`outsider unseals captured reply → ${hex(guess)}: ${r.live ? "live" : "refused"}`, r.live ? "bad" : "");
+};
+$("o_resolve").onclick = async () => {
+  const v = $("o_dest").value.trim().replace(/^0x/i, "");
+  if (!/^[0-9a-f]{1,16}$/i.test(v)) return oResult("enter up to 16 hex digits", "warn");
+  const r = await api("resolve", { dest: v });
+  oResult(`${v}: ${r.live ? "live" : "refused"}`, r.live ? "warn" : "ok");
+  log(`resolve ${v}: ${r.live ? "live" : "refused"}`);
+};
+$("o_guess").onclick = async () => {
+  let hits = 0;
+  for (let i = 0; i < 200; i++) if ((await api("resolve", { dest: hex(randKey()[0]) })).live) hits++;
+  oResult(`200 random guesses: ${hits} live`, hits ? "bad" : "ok");
+  log(`outsider guessed 200 destinations: ${hits} live`, hits ? "bad" : "");
+};
+
+setInterval(refresh, 500);
+refresh();
+</script>
+</body>
+</html>

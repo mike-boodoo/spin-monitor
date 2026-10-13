@@ -1,7 +1,7 @@
 CC     ?= gcc
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -pthread
 
-all: spinmon test_contention test_monitor_lease test_rendezvous
+all: spinmon test_contention test_monitor_lease test_rendezvous rv_server
 
 spinmon: spinmon.c
 	$(CC) $(CFLAGS) $< -o $@
@@ -16,6 +16,13 @@ test_rendezvous: test_rendezvous.c spinmon.c
 	$(CC) $(CFLAGS) $< -o $@
 
 # Lease/monitor tests are deterministic; the contention gate needs a baseline (run `make baseline` first).
+rv_server: frontend/rv_server.c spinmon.c
+	$(CC) $(CFLAGS) $< -o $@
+
+# Browser test bench for the rendezvous: http://127.0.0.1:8080/
+serve: rv_server
+	./rv_server 8080 frontend/index.html
+
 test: test_monitor_lease test_rendezvous
 	./test_monitor_lease
 	./test_rendezvous
@@ -30,6 +37,6 @@ demo: spinmon
 	./spinmon
 
 clean:
-	rm -f spinmon test_contention test_monitor_lease test_rendezvous
+	rm -f spinmon test_contention test_monitor_lease test_rendezvous rv_server
 
-.PHONY: all test baseline gate demo clean
+.PHONY: all test baseline gate demo serve clean
